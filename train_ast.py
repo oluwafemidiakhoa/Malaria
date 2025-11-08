@@ -134,7 +134,9 @@ def main(cfg):
 
     # Setup optimizer
     opt = AdamW(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
-    criterion = nn.CrossEntropyLoss()
+
+    # AST requires per-sample losses, so use reduction='none'
+    criterion = nn.CrossEntropyLoss(reduction='none')
 
     # Configure AST
     ast_cfg = ASTConfig(

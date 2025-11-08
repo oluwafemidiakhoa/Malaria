@@ -58,7 +58,33 @@ If you prefer training without AST (still gets 95-97% accuracy):
 !python train.py --config configs/config.yaml
 ```
 
-### 2. Kaggle API Error in Colab
+### 2. AST Error: "Loss tensor has no dimensions (scalar)"
+
+**Error Message:**
+```
+ValueError: Loss tensor has no dimensions (scalar). Please ensure your criterion uses reduction='none' for per-sample losses.
+```
+
+**Cause:**
+AST needs per-sample losses, but the criterion was using `reduction='mean'` (default).
+
+**SOLUTION:**
+This is fixed in the latest code. If you cloned before this fix, pull the latest:
+
+```python
+!git pull origin main
+```
+
+Or manually fix `train_ast.py` line 139:
+```python
+# Change from:
+criterion = nn.CrossEntropyLoss()
+
+# To:
+criterion = nn.CrossEntropyLoss(reduction='none')
+```
+
+### 3. Kaggle API Error in Colab
 
 **Error:** `AttributeError: 'NoneType' object has no attribute 'kernel'`
 
