@@ -262,7 +262,7 @@ def create_colab_config():
         "ast_adapt_kp": 0.005,
         "ast_adapt_ki": 0.0001,
         "ast_ema_alpha": 0.1,
-        "ast_warmup_epochs": 2,
+        "ast_warmup_epochs": 0,  # Set to 0 to avoid AST library bug with loss dimensions
     }
 
     config_path = Path("configs/config_colab.yaml")
