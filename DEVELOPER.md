@@ -1,6 +1,8 @@
-# CLAUDE.md
+# DEVELOPER.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Developer documentation for the Malaria Detection AI project.
+
+**Developer:** Oluwafemi Idiakhoa
 
 ## Project Overview
 

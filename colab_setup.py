@@ -185,7 +185,8 @@ def install_dependencies():
         "scikit-learn",
         "matplotlib",
         "seaborn",
-        "adaptive-sparse-training>=1.0.1"  # Use fixed version
+        "adaptive-sparse-training>=1.0.1",  # Use fixed version
+        "onnx"  # For model export
     ]
 
     # Install in one go
