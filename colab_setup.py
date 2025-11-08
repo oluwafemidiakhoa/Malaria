@@ -27,7 +27,7 @@ def check_colab():
         return False
 
 
-def setup_kaggle_api():
+def setup_kaggle_api(skip_if_exists=True):
     """
     Setup Kaggle API credentials
 
@@ -39,20 +39,42 @@ def setup_kaggle_api():
     """
     print("🔑 Setting up Kaggle API...")
 
+    # Check if Kaggle is already configured
+    kaggle_path = os.path.expanduser('~/.kaggle/kaggle.json')
+    if os.path.exists(kaggle_path) and skip_if_exists:
+        print("✅ Kaggle API already configured!")
+        return
+
     if check_colab():
-        from google.colab import files
-        print("\n📁 Please upload your kaggle.json file:")
-        print("   (Download from: https://www.kaggle.com/settings -> API -> Create New Token)")
-        uploaded = files.upload()
+        # Check if we're in an interactive environment
+        try:
+            from google.colab import files
+            get_ipython()  # This will raise NameError if not in IPython/notebook
 
-        if 'kaggle.json' not in uploaded:
-            raise FileNotFoundError("kaggle.json not found. Please upload your Kaggle API token.")
+            print("\n📁 Please upload your kaggle.json file:")
+            print("   (Download from: https://www.kaggle.com/settings -> API -> Create New Token)")
+            uploaded = files.upload()
 
-        # Setup Kaggle credentials
-        os.makedirs('/root/.kaggle', exist_ok=True)
-        shutil.move('kaggle.json', '/root/.kaggle/kaggle.json')
-        os.chmod('/root/.kaggle/kaggle.json', 0o600)
-        print("✅ Kaggle API configured successfully!")
+            if 'kaggle.json' not in uploaded:
+                raise FileNotFoundError("kaggle.json not found. Please upload your Kaggle API token.")
+
+            # Setup Kaggle credentials
+            os.makedirs('/root/.kaggle', exist_ok=True)
+            shutil.move('kaggle.json', '/root/.kaggle/kaggle.json')
+            os.chmod('/root/.kaggle/kaggle.json', 0o600)
+            print("✅ Kaggle API configured successfully!")
+        except NameError:
+            # Not in interactive environment, skip file upload
+            print("\n⚠️  Running as script - cannot upload files interactively")
+            print("   Please configure Kaggle API manually in a notebook cell:")
+            print("")
+            print("   from google.colab import files")
+            print("   uploaded = files.upload()")
+            print("   !mkdir -p ~/.kaggle")
+            print("   !cp kaggle.json ~/.kaggle/")
+            print("   !chmod 600 ~/.kaggle/kaggle.json")
+            print("")
+            raise RuntimeError("Kaggle API not configured. Please set it up manually in a notebook cell.")
     else:
         print("⚠️  Not running in Colab. Please ensure kaggle.json is in ~/.kaggle/")
 
