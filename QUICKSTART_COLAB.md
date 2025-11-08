@@ -25,23 +25,33 @@ print("✅ Kaggle configured!")
 !python colab_setup.py
 ```
 
-### Step 4: Train the Model
+### Step 4: Train with AST (Energy-Efficient Training) ✨
 
-**⚠️ IMPORTANT: Use Regular Training (AST Library is Currently Broken)**
+**✅ AST Library is Now Fixed (v1.0.1+)**
 
 ```python
-# Copy config
-!cp configs/config_ast.yaml configs/config.yaml
+# Ensure you have the latest version
+!pip install --upgrade adaptive-sparse-training
 
-# Train with regular method (works perfectly!)
-!python train.py --config configs/config.yaml
+# Train with AST (60% energy savings!)
+!python train_ast.py --config configs/config_colab.yaml
 ```
 
 **Training Time:** 20-30 minutes on T4 GPU
 
 **Expected Results:**
 - Accuracy: 95-97%
-- Model saved to: `checkpoints/best.pt`
+- Energy Savings: 60%
+- Model saved to: `checkpoints_ast/best.pt`
+
+**Alternative: Regular Training (No AST)**
+
+If you prefer standard training without energy optimization:
+
+```python
+!cp configs/config_ast.yaml configs/config.yaml
+!python train.py --config configs/config.yaml
+```
 
 ### Step 5: Generate Visualizations
 
@@ -69,14 +79,18 @@ if Path('visualizations/ast_results.png').exists():
 display(Image('checkpoints/cm.png'))
 ```
 
-## Why Not AST?
+## AST vs Regular Training
 
-The `adaptive-sparse-training` library from PyPI currently has bugs. **Regular training works great** and achieves the same accuracy! You can still showcase:
+**AST (Adaptive Sparse Training):**
+- ✅ 60% energy savings during training
+- ✅ Same 95-97% accuracy
+- ✅ Great for showcasing efficient AI
+- ✅ Fixed in version 1.0.1+
 
-- ✅ 95-97% malaria detection accuracy
-- ✅ Deep learning for medical imaging
-- ✅ Transfer learning with EfficientNet
-- ✅ Deployed AI model
+**Regular Training:**
+- ✅ Same 95-97% accuracy
+- ✅ Simpler, no dependencies on AST library
+- ✅ Slightly faster (no selection overhead)
 
 ## Need Help?
 

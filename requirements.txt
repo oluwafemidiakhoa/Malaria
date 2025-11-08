@@ -7,5 +7,5 @@ pyyaml
 scikit-learn
 matplotlib
 seaborn
-adaptive-sparse-training
+adaptive-sparse-training>=1.0.1
 gradio

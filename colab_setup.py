@@ -185,12 +185,23 @@ def install_dependencies():
         "scikit-learn",
         "matplotlib",
         "seaborn",
-        "adaptive-sparse-training"
+        "adaptive-sparse-training>=1.0.1"  # Use fixed version
     ]
 
     # Install in one go
     os.system(f"pip install -q {' '.join(packages)}")
     print("✅ All dependencies installed!")
+
+    # Verify AST version
+    try:
+        import pkg_resources
+        ast_version = pkg_resources.get_distribution("adaptive-sparse-training").version
+        print(f"   adaptive-sparse-training version: {ast_version}")
+        if ast_version < "1.0.1":
+            print("   ⚠️  Old version detected. Upgrading...")
+            os.system("pip install --upgrade adaptive-sparse-training>=1.0.1")
+    except:
+        pass
 
 
 def verify_gpu():
@@ -262,7 +273,7 @@ def create_colab_config():
         "ast_adapt_kp": 0.005,
         "ast_adapt_ki": 0.0001,
         "ast_ema_alpha": 0.1,
-        "ast_warmup_epochs": 0,  # Set to 0 to avoid AST library bug with loss dimensions
+        "ast_warmup_epochs": 2,  # Warmup now works with fixed AST library v1.0.1+
     }
 
     config_path = Path("configs/config_colab.yaml")

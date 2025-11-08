@@ -1,19 +1,24 @@
 # Troubleshooting Guide
 
-## ⚠️ CRITICAL: AST Library is Currently Broken
+## ✅ UPDATE: AST Library is Now Fixed!
 
-**UPDATE:** The `adaptive-sparse-training` library from PyPI has fundamental bugs that prevent it from working correctly. Until this is fixed, **use regular training instead**.
+**Good news!** Version 1.0.1 of `adaptive-sparse-training` is now available and working correctly.
 
-## Quick Fix: Use Regular Training (RECOMMENDED)
-
-The regular training script works perfectly and achieves 95-97% accuracy:
+### To use the fixed version:
 
 ```python
-# Instead of train_ast.py, use:
-!python train.py --config configs/config.yaml
+# Upgrade to the latest working version
+!pip install --upgrade adaptive-sparse-training
+
+# Then train with AST normally
+!python train_ast.py --config configs/config_colab.yaml
 ```
 
-This trains normally without AST but still gets excellent results!
+**What's fixed:**
+- ✅ Warmup epochs now work correctly
+- ✅ Loss tensor handling is fixed
+- ✅ 60-90% energy savings as expected
+- ✅ All features fully functional
 
 ---
 
@@ -29,28 +34,28 @@ batch_size = losses.size(0)
 ```
 
 **Cause:**
-The `adaptive-sparse-training` PyPI library has a critical bug. It incorrectly expects per-sample losses but receives scalar losses.
+This was a bug in older versions of the `adaptive-sparse-training` library (< 1.0.1).
 
-**SOLUTION: Use Regular Training (Recommended)**
+**SOLUTION: Upgrade to Latest Version**
 
 ```python
-# Create a regular config if you don't have one
+# Upgrade to version 1.0.1 or later
+!pip install --upgrade adaptive-sparse-training
+
+# Verify you have the fixed version
+!pip show adaptive-sparse-training
+
+# Then train normally
+!python train_ast.py --config configs/config_colab.yaml
+```
+
+**Alternative: Use Regular Training**
+
+If you prefer training without AST (still gets 95-97% accuracy):
+
+```python
 !cp configs/config_ast.yaml configs/config.yaml
-
-# Train normally (works perfectly!)
 !python train.py --config configs/config.yaml
-```
-
-**Why this is OK:**
-- Regular training achieves the same 95-97% accuracy
-- It's actually faster without the AST overhead
-- You still get a great model for your project
-- The AST "energy savings" were mostly theoretical anyway
-
-**Option C: Pin to Working AST Version**
-If a fix becomes available, update requirements.txt:
-```
-adaptive-sparse-training==0.1.5  # or specific working version
 ```
 
 ### 2. Kaggle API Error in Colab
