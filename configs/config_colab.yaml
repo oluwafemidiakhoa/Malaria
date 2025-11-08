@@ -1,0 +1,32 @@
+# AST-Enabled Malaria Classification Configuration for Google Colab
+# Optimized for Colab's free tier GPU (T4)
+
+# Model Configuration
+model_name: efficientnet_b0
+num_classes: 2
+image_size: 224
+
+# Training Hyperparameters (Colab-optimized)
+epochs: 30
+batch_size: 32  # Reduced for Colab's memory constraints
+learning_rate: 0.0003
+weight_decay: 0.0001
+num_workers: 2
+amp: true  # Automatic Mixed Precision for additional speedup
+
+# Data Paths
+train_dir: data/train
+val_dir: data/val
+
+# Checkpointing
+save_dir: checkpoints_ast
+resume: true
+patience: 7  # Early stopping patience
+
+# AST Configuration - Energy-Saving Magic for Colab! ✨
+ast_target_activation_rate: 0.40  # 40% activation = 60% energy savings
+ast_initial_threshold: 3.0
+ast_adapt_kp: 0.005
+ast_adapt_ki: 0.0001
+ast_ema_alpha: 0.1
+ast_warmup_epochs: 0  # No warmup for faster results on Colab
