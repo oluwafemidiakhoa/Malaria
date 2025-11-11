@@ -1,734 +1,335 @@
-"""
-🌿 AI-Powered Malaria Detection System
-Advanced Gradio Interface with Real-time Visualization
+# app.py — Gradio UI with Inference, Validation, 📈 Dashboard (+ Compare runs),
+# ONNX export, and Hub-hosted weights via hf_hub_download.
 
-Developer: Oluwafemi Idiakhoa
-Accuracy: 94.3% | Energy Savings: 85%
-"""
-
-import gradio as gr
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from io import BytesIO
-import base64
-import json
-from pathlib import Path
+# ---- Environment fixes (before importing NumPy/Torch) ----
 import os
+os.environ["OMP_NUM_THREADS"] = "1"  # silence libgomp warning in HF Spaces
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+import io, json, glob
+import numpy as np
+import pandas as pd
+from PIL import Image
+import gradio as gr
+import torch, torch.nn as nn
+from torchvision import models, transforms, datasets
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from huggingface_hub import hf_hub_download
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "checkpoints/best.pt"
-IMAGE_SIZE = 224
-CLASS_NAMES = ["🦠 Parasitized (Infected)", "✅ Uninfected (Healthy)"]
-COLORS = {
-    "infected": "#FF4444",
-    "healthy": "#44FF44",
-    "primary": "#2563EB",
-    "secondary": "#10B981"
-}
+# ---- Local utils (Grad-CAM) ----
+from cam_utils import grad_cam
 
-# Performance metrics from training
-METRICS = {
-    "accuracy": 94.3,
-    "energy_savings": 85.0,
-    "precision_infected": 91.7,
-    "precision_healthy": 96.8,
-    "recall_infected": 96.8,
-    "recall_healthy": 91.7,
-    "total_samples": 27558,
-    "training_time": "30 minutes",
-    "model_size": "16 MB"
-}
+# ===================== Config =====================
+MODEL_NAME  = os.environ.get("MODEL_NAME", "efficientnet_b0")
+NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "2"))
+IMAGE_SIZE  = int(os.environ.get("IMAGE_SIZE", "224"))
+DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+CLASS_NAMES = ["Parasitized", "Uninfected"] if NUM_CLASSES == 2 else [str(i) for i in range(NUM_CLASSES)]
 
-# ============================================================================
-# MODEL LOADING
-# ============================================================================
+# Prefer Hub → local env path → checkpoints/* fallback
+HF_REPO_ID   = os.environ.get("HF_REPO_ID", "").strip()
+HF_WEIGHTS   = os.environ.get("HF_WEIGHTS", "best.pt").strip() if HF_REPO_ID else ""
+WEIGHTS_PATH = os.environ.get("WEIGHTS_PATH", "checkpoints/best.pt")
 
-def build_model():
-    """Build EfficientNet-B0 model"""
-    model = models.efficientnet_b0(weights=None)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 2)
-    return model
 
-# Load model
-print(f"🔧 Loading model on {DEVICE}...")
-model = build_model().to(DEVICE)
+def resolve_weights() -> str:
+    # 1) Try Hub
+    if HF_REPO_ID:
+        try:
+            path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_WEIGHTS)
+            return path
+        except Exception as e:
+            print(f"[hub] failed to download {HF_REPO_ID}:{HF_WEIGHTS} → {e}")
+    # 2) Local explicit env path
+    if os.path.exists(WEIGHTS_PATH):
+        return WEIGHTS_PATH
+    # 3) Local fallbacks
+    candidates = ["checkpoints/best.pt", "checkpoints/last.pt"] + sorted(glob.glob("checkpoints/*.pt"))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(
+        "No checkpoint found. Upload a .pt into /checkpoints, "
+        "or set HF_REPO_ID/HF_WEIGHTS, or WEIGHTS_PATH."
+    )
 
-# Try to load weights
-if Path(MODEL_PATH).exists():
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    print("✅ Model loaded successfully!")
-else:
-    print("⚠️ Warning: Model weights not found. Using untrained model for demo.")
 
-model.eval()
+# ===================== Model =====================
+def build_model(name: str, num_classes: int):
+    name = name.lower()
+    if name == "efficientnet_b0":
+        m = models.efficientnet_b0(weights=None)
+        m.classifier[1] = nn.Linear(m.classifier[1].in_features, num_classes)
+        return m
+    elif name == "resnet50":
+        m = models.resnet50(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        return m
+    else:
+        raise ValueError(f"Unsupported model_name: {name}")
 
-# ============================================================================
-# IMAGE PREPROCESSING
-# ============================================================================
 
-transform = transforms.Compose([
-    transforms.Resize(256),
+CHECKPOINT_FILE = resolve_weights()
+_model = build_model(MODEL_NAME, NUM_CLASSES).to(DEVICE)
+_state = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
+try:
+    _model.load_state_dict(_state)               # plain state_dict
+except Exception:
+    _model.load_state_dict(_state["state_dict"]) # or checkpoint dict
+_model.eval()
+
+_pre = transforms.Compose([
+    transforms.Resize(int(IMAGE_SIZE*1.15)),
     transforms.CenterCrop(IMAGE_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# ============================================================================
-# GRAD-CAM IMPLEMENTATION
-# ============================================================================
 
-class GradCAM:
-    """Gradient-weighted Class Activation Mapping"""
-
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-
-        # Register hooks
-        target_layer.register_forward_hook(self.save_activation)
-        target_layer.register_full_backward_hook(self.save_gradient)
-
-    def save_activation(self, module, input, output):
-        self.activations = output.detach()
-
-    def save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0].detach()
-
-    def generate_cam(self, input_tensor, target_class=None):
-        # Forward pass
-        output = self.model(input_tensor)
-
-        if target_class is None:
-            target_class = output.argmax(dim=1).item()
-
-        # Backward pass
-        self.model.zero_grad()
-        output[0, target_class].backward()
-
-        # Generate CAM
-        gradients = self.gradients[0]  # [C, H, W]
-        activations = self.activations[0]  # [C, H, W]
-
-        # Global average pooling on gradients
-        weights = gradients.mean(dim=(1, 2))  # [C]
-
-        # Weighted combination of activation maps
-        cam = torch.zeros(activations.shape[1:], device=DEVICE)  # [H, W]
-        for i, w in enumerate(weights):
-            cam += w * activations[i]
-
-        # ReLU and normalize
-        cam = torch.relu(cam)
-        cam = cam - cam.min()
-        if cam.max() > 0:
-            cam = cam / cam.max()
-
-        return cam.cpu().numpy(), output, target_class
-
-# Initialize Grad-CAM
-gradcam = GradCAM(model, model.features[-1])
-
-# ============================================================================
-# VISUALIZATION FUNCTIONS
-# ============================================================================
-
-def create_gradcam_overlay(image, cam, alpha=0.5):
-    """Create beautiful Grad-CAM overlay"""
-    # Resize CAM to image size
-    cam_resized = Image.fromarray(np.uint8(cam * 255)).resize(image.size, Image.BILINEAR)
-    cam_resized = np.array(cam_resized) / 255.0
-
-    # Apply colormap
-    heatmap = cm.jet(cam_resized)[:, :, :3]
-
-    # Convert image to numpy
-    img_array = np.array(image) / 255.0
-
-    # Overlay
-    overlayed = img_array * (1 - alpha) + heatmap * alpha
-    overlayed = np.clip(overlayed * 255, 0, 255).astype(np.uint8)
-
-    return Image.fromarray(overlayed)
-
-def create_confidence_chart(probabilities):
-    """Create beautiful confidence visualization"""
-    fig, ax = plt.subplots(figsize=(8, 4), facecolor='white')
-
-    classes = ['Parasitized\n(Infected)', 'Uninfected\n(Healthy)']
-    colors = [COLORS['infected'], COLORS['healthy']]
-
-    bars = ax.barh(classes, probabilities * 100, color=colors, alpha=0.8, edgecolor='black', linewidth=2)
-
-    # Add percentage labels
-    for i, (bar, prob) in enumerate(zip(bars, probabilities)):
-        width = bar.get_width()
-        ax.text(width + 2, bar.get_y() + bar.get_height()/2,
-                f'{prob*100:.1f}%',
-                va='center', ha='left', fontsize=14, fontweight='bold')
-
-    ax.set_xlim(0, 105)
-    ax.set_xlabel('Confidence (%)', fontsize=12, fontweight='bold')
-    ax.set_title('AI Prediction Confidence', fontsize=14, fontweight='bold', pad=15)
-    ax.grid(axis='x', alpha=0.3, linestyle='--')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    plt.tight_layout()
-
-    # Convert to image
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
-    buf.seek(0)
-    plt.close()
-
-    return Image.open(buf)
-
-def create_metrics_card():
-    """Create performance metrics visualization"""
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8), facecolor='white')
-    fig.suptitle('🏆 Model Performance Metrics', fontsize=16, fontweight='bold', y=0.98)
-
-    # Accuracy gauge
-    ax = axes[0, 0]
-    ax.pie([METRICS['accuracy'], 100 - METRICS['accuracy']],
-           colors=[COLORS['primary'], '#E5E7EB'],
-           startangle=90, counterclock=False,
-           wedgeprops=dict(width=0.3))
-    ax.text(0, 0, f"{METRICS['accuracy']:.1f}%",
-            ha='center', va='center', fontsize=24, fontweight='bold')
-    ax.set_title('Overall Accuracy', fontsize=12, fontweight='bold', pad=10)
-
-    # Energy Savings gauge
-    ax = axes[0, 1]
-    ax.pie([METRICS['energy_savings'], 100 - METRICS['energy_savings']],
-           colors=[COLORS['secondary'], '#E5E7EB'],
-           startangle=90, counterclock=False,
-           wedgeprops=dict(width=0.3))
-    ax.text(0, 0, f"{METRICS['energy_savings']:.0f}%",
-            ha='center', va='center', fontsize=24, fontweight='bold')
-    ax.set_title('Energy Savings', fontsize=12, fontweight='bold', pad=10)
-
-    # Precision/Recall bars
-    ax = axes[1, 0]
-    metrics_data = [METRICS['precision_infected'], METRICS['precision_healthy'],
-                    METRICS['recall_infected'], METRICS['recall_healthy']]
-    labels = ['Precision\n(Infected)', 'Precision\n(Healthy)',
-              'Recall\n(Infected)', 'Recall\n(Healthy)']
-    bars = ax.bar(range(4), metrics_data,
-                   color=[COLORS['infected'], COLORS['healthy'], COLORS['infected'], COLORS['healthy']],
-                   alpha=0.7, edgecolor='black', linewidth=1.5)
-    ax.set_ylim(0, 105)
-    ax.set_xticks(range(4))
-    ax.set_xticklabels(labels, fontsize=9)
-    ax.set_ylabel('Score (%)', fontsize=10, fontweight='bold')
-    ax.set_title('Per-Class Performance', fontsize=12, fontweight='bold', pad=10)
-    ax.grid(axis='y', alpha=0.3, linestyle='--')
-
-    for bar, val in zip(bars, metrics_data):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, height + 2,
-                f'{val:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-    # Info box
-    ax = axes[1, 1]
-    ax.axis('off')
-    info_text = f"""
-    📊 Dataset: {METRICS['total_samples']:,} images
-    ⏱️ Training Time: {METRICS['training_time']}
-    💾 Model Size: {METRICS['model_size']}
-    🔬 Architecture: EfficientNet-B0
-    ⚡ Method: Adaptive Sparse Training
-    🌱 Carbon Footprint: 85% reduced
-    """
-    ax.text(0.5, 0.5, info_text.strip(),
-            ha='center', va='center', fontsize=11,
-            bbox=dict(boxstyle='round,pad=1', facecolor='#F3F4F6', edgecolor='black', linewidth=2))
-
-    plt.tight_layout()
-
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
-    buf.seek(0)
-    plt.close()
-
-    return Image.open(buf)
-
-# ============================================================================
-# PREDICTION FUNCTION
-# ============================================================================
-
-def predict_malaria(image):
-    """
-    Advanced prediction with Grad-CAM visualization
-
-    Args:
-        image: PIL Image or numpy array
-
-    Returns:
-        tuple: (diagnosis_html, gradcam_image, confidence_chart, original_image)
-    """
+# ===================== Inference =====================
+def predict(image: Image.Image, show_cam: bool):
     if image is None:
-        return (
-            "<h2 style='color: red;'>⚠️ Please upload an image</h2>",
-            None,
-            None,
-            None
+        return {"label": "", "confidences": []}, None
+    img = image.convert("RGB")
+    x = _pre(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        logits = _model(x).cpu().numpy().squeeze()
+    probs = np.exp(logits - logits.max()); probs = probs / probs.sum()
+
+    # Gradio Label expects dict {class: prob}
+    label_dict = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+    overlay = None
+    if show_cam:
+        cam = grad_cam(_model, img, img_size=IMAGE_SIZE, device=DEVICE)
+        overlay = Image.fromarray((cam["overlay"]*255).astype("uint8"))
+    return label_dict, overlay
+
+
+# ===================== ONNX Export =====================
+def export_onnx(precision: str):
+    m = build_model(MODEL_NAME, NUM_CLASSES).to(DEVICE)
+    state = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
+    try:
+        m.load_state_dict(state)
+    except Exception:
+        m.load_state_dict(state["state_dict"])
+    m.eval()
+
+    dummy = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+    if precision == "fp16":
+        m = m.half(); dummy = dummy.half()
+
+    dynamic_axes = {"input": {0: "batch"}, "output": {0: "batch"}}
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m, dummy, buf,
+        input_names=["input"], output_names=["output"],
+        dynamic_axes=dynamic_axes, opset_version=17, do_constant_folding=True
+    )
+    fname = f"model_{MODEL_NAME}_{precision}_{IMAGE_SIZE}.onnx"
+    buf.seek(0)
+    # Gradio File expects (filename, filelike/bytes)
+    return fname, buf
+
+
+# ===================== Validation (optional) =====================
+def validate(zip_file):
+    import tempfile, zipfile
+    if zip_file is None:
+        return "Upload a .zip of your validation set.", None
+
+    tmp = tempfile.mkdtemp()
+    with zipfile.ZipFile(zip_file.name, 'r') as zf:
+        zf.extractall(tmp)
+
+    ds = datasets.ImageFolder(tmp, transform=_pre)
+    dl = torch.utils.data.DataLoader(ds, batch_size=64, shuffle=False, num_workers=2)
+    ys, ps = [], []
+    with torch.no_grad():
+        for xb, yb in dl:
+            preds = _model(xb.to(DEVICE)).argmax(1).cpu().numpy()
+            ys.extend(yb.numpy()); ps.extend(preds)
+
+    import sklearn.metrics as sk
+    rep = sk.classification_report(ys, ps, target_names=ds.classes, output_dict=True)
+    cm  = sk.confusion_matrix(ys, ps)
+
+    fig, ax = plt.subplots(figsize=(4.5,4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=ds.classes, yticklabels=ds.classes, ax=ax)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True"); fig.tight_layout()
+    buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160); buf.seek(0)
+    cm_img = Image.open(buf).convert("RGB")
+
+    return json.dumps(rep, indent=2), cm_img
+
+
+# ===================== Dashboard helpers =====================
+METRICS_DEFAULT = "checkpoints/metrics.csv"
+
+def _plot_to_pil(df: pd.DataFrame, ycol: str, title: str, ylabel: str):
+    if ycol not in df.columns: return None
+    s = df[["epoch", ycol]].dropna()
+    if len(s) == 0: return None
+    fig, ax = plt.subplots(figsize=(5.6,3.2))
+    ax.plot(s["epoch"], s[ycol], marker="o")
+    ax.set_title(title); ax.set_xlabel("epoch"); ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+def load_metrics(path: str):
+    if not os.path.exists(path):
+        return "No metrics file found.", None, None, None, None, None, None
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return f"Failed to read CSV: {e}", None, None, None, None, None, None
+
+    tail = df.tail(10).to_markdown(index=False)
+    fig_loss = _plot_to_pil(df, "train_loss", "Training Loss", "loss")
+    fig_acc  = _plot_to_pil(df, "val_acc",   "Validation Accuracy", "acc")
+    fig_act  = _plot_to_pil(df, "act_rate",  "Activation Rate", "fraction")
+    fig_save = _plot_to_pil(df, "save_rate", "Energy Savings", "fraction")
+    fig_thr  = _plot_to_pil(df, "threshold", "Activation Threshold", "threshold")
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    # Return a tuple (filename, bytes) for DownloadButton.value
+    return tail, fig_loss, fig_acc, fig_act, fig_save, fig_thr, ("metrics.csv", csv_bytes)
+
+def upload_metrics(file):
+    if file is None:
+        return "No file uploaded.", None, None, None, None, None, None
+    os.makedirs("checkpoints", exist_ok=True)
+    dst = METRICS_DEFAULT
+    with open(dst, "wb") as f:
+        f.write(file.read())
+    return load_metrics(dst)
+
+# ---- Compare runs: overlay multiple metrics.csv files ----
+def _overlay_from_runs(runs, ycol, title, ylabel):
+    fig, ax = plt.subplots(figsize=(6.2,3.2))
+    found = False
+    for name, df in runs:
+        if ycol in df.columns:
+            s = df[["epoch", ycol]].dropna()
+            if len(s):
+                ax.plot(s["epoch"], s[ycol], marker="o", label=name)
+                found = True
+    if not found:
+        plt.close(fig)
+        return None
+    ax.set_title(title); ax.set_xlabel("epoch"); ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+def compare_runs(files):
+    if not files or len(files) == 0:
+        return "Upload 2+ metrics.csv files to compare.", None, None, None, None, None
+    runs = []
+    for f in files:
+        try:
+            df = pd.read_csv(f.name)
+            runs.append((os.path.basename(f.name), df))
+        except Exception as e:
+            return f"Failed reading {f.name}: {e}", None, None, None, None, None
+
+    msg    = f"Compared {len(runs)} runs."
+    p_loss = _overlay_from_runs(runs, "train_loss", "Training Loss (overlay)", "loss")
+    p_acc  = _overlay_from_runs(runs, "val_acc",    "Validation Accuracy (overlay)", "acc")
+    p_act  = _overlay_from_runs(runs, "act_rate",   "Activation Rate (overlay)", "fraction")
+    p_save = _overlay_from_runs(runs, "save_rate",  "Energy Savings (overlay)", "fraction")
+    p_thr  = _overlay_from_runs(runs, "threshold",  "Activation Threshold (overlay)", "threshold")
+    return msg, p_loss, p_acc, p_act, p_save, p_thr
+
+
+# ===================== Gradio UI =====================
+with gr.Blocks(title="Malaria Diagnostic Assistant") as demo:
+    gr.Markdown("# 🩸 Malaria Diagnostic Assistant")
+    gr.Markdown("Prototype — energy-efficient triage with human-in-the-loop (Adaptive Sparse Training).")
+
+    # -------- Inference --------
+    with gr.Tab("🔍 Inference"):
+        gr.Markdown(f"**Weights:** `{os.path.basename(CHECKPOINT_FILE)}` • **Backbone:** `{MODEL_NAME}` • **Device:** `{DEVICE}`")
+        with gr.Row():
+            with gr.Column(scale=1):
+                img_in   = gr.Image(type="pil", label="Upload blood smear image")
+                show_cam = gr.Checkbox(value=True, label="Show Grad-CAM")
+                btn_pred = gr.Button("Predict", variant="primary")
+
+                gr.Markdown("### Export ONNX")
+                onnx_precision = gr.Radio(choices=["fp32", "fp16"], value="fp32", label="Precision")
+                btn_onnx = gr.Button("Export ONNX")
+                onnx_file = gr.File(label="Download ONNX", interactive=False)
+
+            with gr.Column(scale=1):
+                label_out = gr.Label(num_top_classes=2, label="Prediction & Probabilities")
+                cam_out   = gr.Image(type="pil", label="Grad-CAM overlay")
+
+        btn_pred.click(fn=predict, inputs=[img_in, show_cam], outputs=[label_out, cam_out])
+
+        def onnx_wrap(prec):
+            fname, fobj = export_onnx(prec)
+            # File component expects (filename, filelike/bytes)
+            return (fname, fobj)
+
+        btn_onnx.click(fn=onnx_wrap, inputs=[onnx_precision], outputs=[onnx_file])
+
+    # -------- Validation --------
+    with gr.Tab("✅ Validation (optional)"):
+        gr.Markdown("Upload a **.zip** containing a folder with class subfolders (e.g., `Parasitized/`, `Uninfected/`).")
+        val_zip   = gr.File(label="Validation ZIP", file_types=[".zip"])
+        btn_eval  = gr.Button("Compute report + confusion matrix")
+        rep_out   = gr.Textbox(label="classification_report (JSON)")
+        cm_img    = gr.Image(type="pil", label="Confusion Matrix")
+        btn_eval.click(fn=validate, inputs=[val_zip], outputs=[rep_out, cm_img])
+
+    # -------- Dashboard --------
+    with gr.Tab("📈 Dashboard"):
+        gr.Markdown("Visualize training logs from `checkpoints/metrics.csv` (written each epoch by your Colab training).")
+
+        with gr.Row():
+            metrics_path = gr.Textbox(value=METRICS_DEFAULT, label="Metrics CSV path")
+            btn_load     = gr.Button("Refresh")
+
+        tail_md   = gr.Markdown(value="Upload metrics or click refresh.")
+        plot_loss = gr.Image(label="Training Loss")
+        plot_acc  = gr.Image(label="Validation Accuracy")
+        plot_act  = gr.Image(label="Activation Rate")
+        plot_save = gr.Image(label="Energy Savings")
+        plot_thr  = gr.Image(label="Activation Threshold")
+        dl_btn    = gr.DownloadButton(label="⬇️ Download metrics.csv", value=None)
+
+        btn_load.click(
+            fn=load_metrics,
+            inputs=[metrics_path],
+            outputs=[tail_md, plot_loss, plot_acc, plot_act, plot_save, plot_thr, dl_btn]
         )
 
-    try:
-        # Convert to PIL if needed
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
+        gr.Markdown("---")
+        gr.Markdown("**Compare runs** — upload multiple `metrics.csv` files to overlay curves:")
+        mult = gr.Files(label="Upload one or more metrics.csv files", file_types=[".csv"])
+        cmp_msg = gr.Markdown()
+        with gr.Row():
+            p_loss = gr.Image(label="Loss (overlay)")
+            p_acc  = gr.Image(label="Val Acc (overlay)")
+        with gr.Row():
+            p_act  = gr.Image(label="Activation (overlay)")
+            p_save = gr.Image(label="Savings (overlay)")
+        p_thr  = gr.Image(label="Threshold (overlay)")
+
+        mult.upload(
+            fn=compare_runs,
+            inputs=[mult],
+            outputs=[cmp_msg, p_loss, p_acc, p_act, p_save, p_thr]
+        )
+
+    gr.Markdown("---")
+    gr.Markdown("Built with EfficientNet-B0 + Adaptive Sparse Training — not a diagnostic device.")
 
-        # Ensure RGB
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-
-        # Store original for display
-        original_image = image.copy()
-
-        # Preprocess
-        img_tensor = transform(image).unsqueeze(0).to(DEVICE)
-
-        # Get prediction with Grad-CAM
-        with torch.set_grad_enabled(True):
-            cam, output, pred_class = gradcam.generate_cam(img_tensor)
-            probabilities = torch.softmax(output, dim=1)[0].detach().cpu().numpy()
-
-        # Generate visualizations
-        gradcam_image = create_gradcam_overlay(original_image, cam, alpha=0.5)
-        confidence_chart = create_confidence_chart(probabilities)
-
-        # Create diagnosis HTML
-        confidence = probabilities[pred_class] * 100
-        diagnosis_class = CLASS_NAMES[pred_class]
-
-        # Determine status and color
-        if pred_class == 0:  # Infected
-            status = "🦠 MALARIA DETECTED"
-            status_color = COLORS['infected']
-            recommendation = """
-            <div style='background: #FEE2E2; padding: 15px; border-radius: 10px; border-left: 5px solid #DC2626; margin-top: 15px;'>
-                <h3 style='color: #DC2626; margin: 0 0 10px 0;'>⚠️ Clinical Recommendation</h3>
-                <ul style='margin: 5px 0; padding-left: 20px; color: #991B1B;'>
-                    <li>Immediate microscopy confirmation recommended</li>
-                    <li>Consider rapid diagnostic test (RDT)</li>
-                    <li>Begin antimalarial treatment protocol if confirmed</li>
-                    <li>Monitor patient symptoms closely</li>
-                </ul>
-            </div>
-            """
-        else:  # Healthy
-            status = "✅ NO MALARIA DETECTED"
-            status_color = COLORS['healthy']
-            recommendation = """
-            <div style='background: #D1FAE5; padding: 15px; border-radius: 10px; border-left: 5px solid #059669; margin-top: 15px;'>
-                <h3 style='color: #059669; margin: 0 0 10px 0;'>✓ Clinical Recommendation</h3>
-                <ul style='margin: 5px 0; padding-left: 20px; color: #065F46;'>
-                    <li>No immediate malaria treatment required</li>
-                    <li>If symptoms persist, conduct additional tests</li>
-                    <li>Consider other differential diagnoses</li>
-                    <li>Routine follow-up as needed</li>
-                </ul>
-            </div>
-            """
-
-        diagnosis_html = f"""
-        <div style='font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>
-            <div style='background: linear-gradient(135deg, {status_color} 0%, {status_color}CC 100%);
-                        padding: 25px; border-radius: 15px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
-                <h1 style='color: white; margin: 0 0 10px 0; font-size: 32px; text-shadow: 2px 2px 4px rgba(0,0,0,0.3);'>
-                    {status}
-                </h1>
-                <p style='color: white; margin: 0; font-size: 18px; opacity: 0.95;'>
-                    AI Diagnosis: <strong>{diagnosis_class}</strong>
-                </p>
-            </div>
-
-            <div style='background: white; padding: 20px; border-radius: 10px; border: 2px solid #E5E7EB; margin-bottom: 15px;'>
-                <h2 style='color: #1F2937; margin: 0 0 15px 0; font-size: 20px;'>📊 Detailed Analysis</h2>
-                <table style='width: 100%; border-collapse: collapse;'>
-                    <tr style='border-bottom: 2px solid #E5E7EB;'>
-                        <td style='padding: 12px 8px; font-weight: bold; color: #6B7280;'>Prediction</td>
-                        <td style='padding: 12px 8px; color: #1F2937; font-weight: bold;'>{diagnosis_class}</td>
-                    </tr>
-                    <tr style='border-bottom: 1px solid #F3F4F6;'>
-                        <td style='padding: 12px 8px; font-weight: bold; color: #6B7280;'>Confidence</td>
-                        <td style='padding: 12px 8px;'>
-                            <span style='font-size: 24px; font-weight: bold; color: {status_color};'>{confidence:.1f}%</span>
-                        </td>
-                    </tr>
-                    <tr style='border-bottom: 1px solid #F3F4F6;'>
-                        <td style='padding: 12px 8px; font-weight: bold; color: #6B7280;'>Parasitized Probability</td>
-                        <td style='padding: 12px 8px; color: #DC2626; font-weight: 600;'>{probabilities[0]*100:.1f}%</td>
-                    </tr>
-                    <tr>
-                        <td style='padding: 12px 8px; font-weight: bold; color: #6B7280;'>Uninfected Probability</td>
-                        <td style='padding: 12px 8px; color: #059669; font-weight: 600;'>{probabilities[1]*100:.1f}%</td>
-                    </tr>
-                </table>
-            </div>
-
-            {recommendation}
-
-            <div style='background: #F9FAFB; padding: 15px; border-radius: 10px; margin-top: 15px; border: 1px solid #E5E7EB;'>
-                <p style='margin: 0; font-size: 13px; color: #6B7280; line-height: 1.6;'>
-                    <strong>⚠️ Disclaimer:</strong> This is a research prototype AI system trained on NIH malaria cell images.
-                    It is NOT FDA-approved and should NOT be used as the sole basis for clinical diagnosis.
-                    Always confirm results with certified laboratory tests and consult qualified healthcare professionals.
-                    Model Accuracy: {METRICS['accuracy']}% on validation set.
-                </p>
-            </div>
-        </div>
-        """
-
-        return diagnosis_html, gradcam_image, confidence_chart, original_image
-
-    except Exception as e:
-        error_html = f"""
-        <div style='background: #FEE2E2; padding: 20px; border-radius: 10px; border-left: 5px solid #DC2626;'>
-            <h2 style='color: #DC2626; margin: 0 0 10px 0;'>❌ Error Processing Image</h2>
-            <p style='color: #991B1B; margin: 0;'>{str(e)}</p>
-            <p style='color: #6B7280; margin: 10px 0 0 0; font-size: 14px;'>
-                Please ensure you upload a valid microscopy image (PNG, JPG, or JPEG format).
-            </p>
-        </div>
-        """
-        return error_html, None, None, None
-
-# ============================================================================
-# GRADIO INTERFACE
-# ============================================================================
-
-# Custom CSS for professional look
-custom_css = """
-#main-title {
-    text-align: center;
-    background: linear-gradient(135deg, #2563EB 0%, #059669 100%);
-    padding: 40px 20px;
-    border-radius: 15px;
-    margin-bottom: 30px;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-}
-
-#main-title h1 {
-    color: white;
-    font-size: 48px;
-    margin: 0 0 10px 0;
-    text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
-}
-
-#main-title p {
-    color: rgba(255,255,255,0.95);
-    font-size: 20px;
-    margin: 0;
-}
-
-.gradio-container {
-    max-width: 1400px !important;
-    margin: auto !important;
-}
-
-#upload-box {
-    border: 3px dashed #2563EB !important;
-    border-radius: 15px !important;
-    background: #F0F9FF !important;
-    min-height: 400px !important;
-}
-
-#analyze-btn {
-    background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%) !important;
-    font-size: 18px !important;
-    padding: 15px 40px !important;
-    font-weight: bold !important;
-    border-radius: 10px !important;
-    border: none !important;
-    box-shadow: 0 4px 6px rgba(37, 99, 235, 0.3) !important;
-}
-
-#analyze-btn:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 12px rgba(37, 99, 235, 0.4) !important;
-}
-
-.metric-badge {
-    display: inline-block;
-    background: #DBEAFE;
-    color: #1E40AF;
-    padding: 8px 16px;
-    border-radius: 20px;
-    font-weight: 600;
-    margin: 5px;
-    font-size: 14px;
-}
-
-#footer {
-    text-align: center;
-    padding: 30px 20px;
-    background: #F9FAFB;
-    border-radius: 10px;
-    margin-top: 40px;
-    border-top: 3px solid #2563EB;
-}
-"""
-
-# Create interface
-with gr.Blocks(css=custom_css, theme=gr.themes.Soft(), title="AI Malaria Detection") as demo:
-
-    # Header
-    gr.HTML("""
-    <div id="main-title">
-        <h1>🔬 AI-Powered Malaria Detection System</h1>
-        <p>Energy-Efficient Deep Learning for Global Health</p>
-        <div style="margin-top: 20px;">
-            <span class="metric-badge">🎯 94.3% Accuracy</span>
-            <span class="metric-badge">⚡ 85% Energy Savings</span>
-            <span class="metric-badge">🚀 Real-time Analysis</span>
-            <span class="metric-badge">🌍 Open Source</span>
-        </div>
-    </div>
-    """)
-
-    # Main content
-    with gr.Tabs() as tabs:
-
-        # Tab 1: Main Diagnosis
-        with gr.Tab("🔬 Diagnosis", id="diagnosis-tab"):
-            gr.Markdown("""
-            ## Upload Blood Smear Image
-
-            Upload a microscopy image of a blood cell to get instant AI-powered malaria diagnosis with explainable AI visualization.
-
-            **Supported formats:** PNG, JPG, JPEG | **Recommended:** High-resolution microscopy images
-            """)
-
-            with gr.Row():
-                with gr.Column(scale=1):
-                    image_input = gr.Image(
-                        label="📤 Upload Cell Image",
-                        type="pil",
-                        elem_id="upload-box"
-                    )
-
-                    analyze_btn = gr.Button(
-                        "🔬 Analyze for Malaria",
-                        variant="primary",
-                        size="lg",
-                        elem_id="analyze-btn"
-                    )
-
-                    gr.Markdown("""
-                    ### 💡 How to Use:
-                    1. Upload a blood smear microscopy image
-                    2. Click "Analyze for Malaria"
-                    3. View AI diagnosis, confidence, and heat map
-                    4. Check the Grad-CAM to see what the AI focuses on
-                    """)
-
-                with gr.Column(scale=2):
-                    diagnosis_output = gr.HTML(label="📋 Diagnosis Report")
-
-                    with gr.Row():
-                        gradcam_output = gr.Image(label="🔥 Grad-CAM Heat Map (What AI Sees)", type="pil")
-                        confidence_output = gr.Image(label="📊 Confidence Scores", type="pil")
-
-            # Examples
-            gr.Markdown("### 🎯 Try Sample Images:")
-            gr.Examples(
-                examples=[
-                    ["examples/infected_1.png"] if Path("examples/infected_1.png").exists() else None,
-                    ["examples/healthy_1.png"] if Path("examples/healthy_1.png").exists() else None,
-                ],
-                inputs=image_input,
-                label="Click to load sample images"
-            )
-
-        # Tab 2: Performance Metrics
-        with gr.Tab("📊 Performance Metrics", id="metrics-tab"):
-            gr.Markdown("""
-            ## 🏆 Model Performance Dashboard
-
-            Comprehensive performance metrics from training on 27,558 NIH malaria cell images.
-            """)
-
-            metrics_display = gr.Image(value=create_metrics_card(), label="Performance Metrics", type="pil")
-
-            gr.Markdown(f"""
-            ### 📈 Detailed Statistics
-
-            | Metric | Value | Description |
-            |--------|-------|-------------|
-            | **Overall Accuracy** | {METRICS['accuracy']}% | Correctly classified cells |
-            | **Energy Savings** | {METRICS['energy_savings']}% | Reduced computational cost |
-            | **Precision (Infected)** | {METRICS['precision_infected']}% | Accuracy of positive predictions |
-            | **Precision (Healthy)** | {METRICS['precision_healthy']}% | Accuracy of negative predictions |
-            | **Recall (Infected)** | {METRICS['recall_infected']}% | Sensitivity for infected cells |
-            | **Recall (Healthy)** | {METRICS['recall_healthy']}% | Sensitivity for healthy cells |
-            | **Training Time** | {METRICS['training_time']} | On NVIDIA A100 GPU |
-            | **Model Size** | {METRICS['model_size']} | Optimized for deployment |
-            | **Dataset Size** | {METRICS['total_samples']:,} images | NIH certified data |
-
-            ### 🔬 Confusion Matrix Results
-
-            - **True Positives:** 2,528 infected cells correctly identified
-            - **True Negatives:** 2,668 healthy cells correctly identified
-            - **False Positives:** 228 (9.1% error rate)
-            - **False Negatives:** 88 (3.2% error rate)
-
-            ### 🌱 Sustainability Impact
-
-            Our Adaptive Sparse Training approach achieved:
-            - **562,106 samples saved** during training (85% reduction)
-            - **~2 hours GPU time saved** compared to standard training
-            - **Estimated 0.8 kg CO₂ reduction** per training run
-            - **Same accuracy** as conventional training methods
-            """)
-
-        # Tab 3: About & Documentation
-        with gr.Tab("📚 About", id="about-tab"):
-            gr.Markdown("""
-            ## 🌿 About This System
-
-            ### What is This?
-
-            This is an **AI-powered malaria detection system** that uses deep learning to classify blood cell images
-            as infected (parasitized) or healthy (uninfected). It combines cutting-edge computer vision with
-            energy-efficient training methods.
-
-            ### Key Features
-
-            - **🎯 High Accuracy:** 94.3% classification accuracy on validation data
-            - **⚡ Energy Efficient:** 85% reduction in training energy using Adaptive Sparse Training
-            - **🔍 Explainable AI:** Grad-CAM visualization shows what the model focuses on
-            - **🚀 Real-time:** Instant predictions (<1 second inference time)
-            - **💾 Lightweight:** Only 16MB model size, deployable on edge devices
-            - **🌍 Open Source:** Free and accessible for research and education
-
-            ### Technology Stack
-
-            - **Model Architecture:** EfficientNet-B0 (Google Brain)
-            - **Training Method:** Adaptive Sparse Training (Sundew Algorithm)
-            - **Framework:** PyTorch 2.0+
-            - **Interface:** Gradio 4.0+
-            - **Deployment:** Hugging Face Spaces
-
-            ### Dataset
-
-            - **Source:** NIH National Library of Medicine
-            - **Total Images:** 27,558 cell images
-            - **Classes:** Parasitized (13,779) / Uninfected (13,779)
-            - **Split:** 80% training / 20% validation
-            - **Quality:** Expert-verified labels from certified medical professionals
-
-            ### Clinical Use Cases
-
-            - **Point-of-Care Screening:** Rapid preliminary diagnosis in clinics
-            - **Telemedicine:** Remote malaria screening support
-            - **Research:** Automated cell analysis and counting
-            - **Education:** Training tool for medical students
-            - **Low-Resource Settings:** Accessible AI for areas with limited lab infrastructure
-
-            ### Performance Benchmarks
-
-            | Method | Accuracy | Training Time | Energy | Model Size |
-            |--------|----------|---------------|--------|------------|
-            | **This Model (AST)** | **94.3%** | **30 min** | **15%** | **16 MB** |
-            | Standard Training | 94.1% | 2.5 hours | 100% | 16 MB |
-            | ResNet50 | 93.8% | 3 hours | 120% | 98 MB |
-            | VGG16 | 92.4% | 4 hours | 150% | 528 MB |
-
-            ### Limitations & Disclaimers
-
-            ⚠️ **Important:** This is a **research prototype** and educational tool. It is:
-
-            - ❌ NOT FDA-approved for clinical use
-            - ❌ NOT a replacement for professional medical diagnosis
-            - ❌ NOT intended as the sole diagnostic tool
-            - ✅ Suitable for research, education, and preliminary screening support
-            - ✅ Requires confirmation with certified laboratory tests
-
-            ### Developer
-
-            **Oluwafemi Idiakhoa**
-            - 🌐 GitHub: [@oluwafemidiakhoa](https://github.com/oluwafemidiakhoa)
-            - 🤗 Hugging Face: [@mgbam](https://huggingface.co/mgbam)
-            - 💼 Developer of energy-efficient medical AI systems
-
-            ### Citation
-
-            If you use this work in your research, please cite:
-
-            ```bibtex
-            @software{idiakhoa2025malaria,
-              title={Energy-Efficient Malaria Detection with Adaptive Sparse Training},
-              author={Idiakhoa, Oluwafemi},
-              year={2025},
-              url={https://huggingface.co/spaces/mgbam/Malaria},
-              note={94.3% accuracy with 85% energy savings}
-            }
-            ```
-
-            ### License
-
-            MIT License - Free for research and educational use
-
-            ### Acknowledgments
-
-            - NIH National Library of Medicine (dataset)
-            - Hugging Face (hosting infrastructure)
-            - PyTorch Team (deep learning framework)
-            - Adaptive Sparse Training library developers
-            - EfficientNet authors (Tan & Le, Google Brain)
-
-            ### Links
-
-            - 📖 [Full Documentation](https://github.com/oluwafemidiakhoa/Malaria)
-            - 💻 [Source Code](https://github.com/oluwafemidiakhoa/Malaria)
-            - 🐛 [Report Issues](https://github.com/oluwafemidiakhoa/Malaria/issues)
-            - 📊 [Dataset Info](https://lhncbc.nlm.nih.gov/LHC-downloads/downloads.html#malaria-datasets)
-            """)
-
-    # Footer
-    gr.HTML("""
-    <div id="footer">
-        <h3 style="color: #1F2937; margin: 0 0 15px 0;">🌍 Democratizing Medical AI for Global Health</h3>
-        <p style="color: #6B7280; margin: 0 0 10px 0;">
-            Made with ❤️ for accessible, sustainable healthcare
-        </p>
-        <p style="color: #9CA3AF; font-size: 14px; margin: 0;">
-            Developer: Oluwafemi Idiakhoa |
-            <a href="https://github.com/oluwafemidiakhoa/Malaria" target="_blank" style="color: #2563EB;">GitHub</a> |
-            <a href="https://huggingface.co/spaces/mgbam/Malaria" target="_blank" style="color: #2563EB;">Hugging Face</a>
-        </p>
-        <p style="color: #D1D5DB; font-size: 12px; margin-top: 15px;">
-            © 2025 | MIT License | Research Prototype
-        </p>
-    </div>
-    """)
-
-    # Connect the button to the prediction function
-    analyze_btn.click(
-        fn=predict_malaria,
-        inputs=image_input,
-        outputs=[diagnosis_output, gradcam_output, confidence_output, gr.Image(visible=False)]
-    )
-
-# Launch
 if __name__ == "__main__":
-    demo.launch(
-        share=False,
-        server_name="0.0.0.0",
-        server_port=7860,
-        show_error=True
-    )
+    demo.launch()
