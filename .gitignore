@@ -62,3 +62,7 @@ kaggle.json
 
 # Git
 .git/
+
+# Exclude deployment folders
+Malaria/
+huggingface_app/
